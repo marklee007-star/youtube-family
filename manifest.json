@@ -1,0 +1,361 @@
+/**
+ * YouTube Family Manager - Google Apps Script
+ * 
+ * วิธีใช้งาน:
+ * 1. เปิด Google Sheets ที่ใช้เป็น Database
+ * 2. ไปที่ Extensions > Apps Script
+ * 3. วางโค้ดทั้งหมดนี้แทนที่โค้ดเดิม
+ * 4. ตั้งค่า NEXTJS_APP_URL และ CRON_SECRET
+ * 5. บันทึก แล้ว Deploy > New deployment > Web app
+ * 6. ตั้ง Trigger: checkExpiredMembers ทำงานทุกวันเวลา 00:01
+ */
+
+// ==================== CONFIG ====================
+
+const CONFIG = {
+  // URL ของ Next.js App ที่ deploy บน Vercel
+  NEXTJS_APP_URL: 'https://your-app.vercel.app',
+  
+  // ต้องตรงกับ CRON_SECRET ใน .env.local
+  CRON_SECRET: 'your_cron_secret_here',
+  
+  // ชื่อ Sheet
+  MEMBERS_SHEET: 'Members',
+  PAYMENTS_SHEET: 'Payments',
+  LOG_SHEET: 'Logs',
+  
+  // Column indices (0-based)
+  COLS: {
+    MEMBER: { EMAIL: 0, FAMILY: 1, EXPIRE: 2, STATUS: 3, LINK: 4, NOTE: 5 },
+    PAYMENT: { TIMESTAMP: 0, EMAIL: 1, AMOUNT: 2 }
+  }
+}
+
+// ==================== UTILITIES ====================
+
+function getSheet(name) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet()
+  let sheet = ss.getSheetByName(name)
+  if (!sheet) {
+    sheet = ss.insertSheet(name)
+    Logger.log(`Created sheet: ${name}`)
+  }
+  return sheet
+}
+
+function addLog(action, detail, status) {
+  try {
+    const logSheet = getSheet(CONFIG.LOG_SHEET)
+    // Add header if empty
+    if (logSheet.getLastRow() === 0) {
+      logSheet.appendRow(['Timestamp', 'Action', 'Detail', 'Status'])
+      logSheet.getRange(1, 1, 1, 4).setFontWeight('bold').setBackground('#ffc0c0')
+    }
+    logSheet.appendRow([
+      new Date().toLocaleString('th-TH'),
+      action,
+      detail,
+      status
+    ])
+  } catch (e) {
+    Logger.log('Log error: ' + e.message)
+  }
+}
+
+/**
+ * เพิ่มวันหมดอายุ 1 เดือน (Calendar Month)
+ * เช่น 31/01 → 28/02, 28/06 → 28/07
+ */
+function addOneMonth(dateStr) {
+  // dateStr format: YYYY-MM-DD
+  const parts = dateStr.split('-')
+  const date = new Date(
+    parseInt(parts[0]),
+    parseInt(parts[1]) - 1,
+    parseInt(parts[2])
+  )
+  
+  const originalDay = date.getDate()
+  date.setMonth(date.getMonth() + 1)
+  
+  // Handle month-end overflow (e.g., Jan 31 → Feb 28)
+  if (date.getDate() < originalDay) {
+    date.setDate(0) // last day of previous month
+  }
+  
+  const y = date.getFullYear()
+  const m = String(date.getMonth() + 1).padStart(2, '0')
+  const d = String(date.getDate()).padStart(2, '0')
+  return `${y}-${m}-${d}`
+}
+
+function formatDateStr(date) {
+  const y = date.getFullYear()
+  const m = String(date.getMonth() + 1).padStart(2, '0')
+  const d = String(date.getDate()).padStart(2, '0')
+  return `${y}-${m}-${d}`
+}
+
+// ==================== MAIN FUNCTIONS ====================
+
+/**
+ * ฟังก์ชันหลัก: ตรวจสอบสมาชิกหมดอายุ
+ * ตั้ง Trigger ให้รันทุกวัน เวลา 00:01
+ */
+function checkExpiredMembers() {
+  Logger.log('=== checkExpiredMembers started ===')
+  
+  try {
+    const sheet = getSheet(CONFIG.MEMBERS_SHEET)
+    const lastRow = sheet.getLastRow()
+    
+    if (lastRow < 2) {
+      Logger.log('No members found')
+      addLog('checkExpired', 'No members', 'Skip')
+      return
+    }
+    
+    const data = sheet.getRange(2, 1, lastRow - 1, 6).getValues()
+    const today = new Date()
+    today.setHours(0, 0, 0, 0)
+    
+    let expiredCount = 0
+    
+    for (let i = 0; i < data.length; i++) {
+      const row = data[i]
+      const email = row[CONFIG.COLS.MEMBER.EMAIL]
+      const expireDateStr = row[CONFIG.COLS.MEMBER.EXPIRE]
+      const status = row[CONFIG.COLS.MEMBER.STATUS]
+      
+      if (!email || !expireDateStr || status === 'Expired') continue
+      
+      let expireDate
+      if (expireDateStr instanceof Date) {
+        expireDate = expireDateStr
+      } else {
+        expireDate = new Date(expireDateStr)
+      }
+      expireDate.setHours(0, 0, 0, 0)
+      
+      if (expireDate < today) {
+        // Update status to Expired
+        const rowNum = i + 2 // +2 for header + 0-based
+        sheet.getRange(rowNum, CONFIG.COLS.MEMBER.STATUS + 1).setValue('Expired')
+        expiredCount++
+        Logger.log(`Expired: ${email}`)
+      }
+    }
+    
+    const msg = `อัปเดตสมาชิกหมดอายุ ${expiredCount} ราย`
+    Logger.log(msg)
+    addLog('checkExpired', msg, 'Success')
+    
+  } catch (e) {
+    const errMsg = 'Error: ' + e.message
+    Logger.log(errMsg)
+    addLog('checkExpired', errMsg, 'Error')
+  }
+}
+
+/**
+ * ประมวลผลการชำระเงินจาก Sheet: Payments
+ * รันอัตโนมัติทุก 30 นาที หรือ trigger จาก onFormSubmit
+ */
+function processPayments() {
+  Logger.log('=== processPayments started ===')
+  
+  try {
+    const paymentsSheet = getSheet(CONFIG.PAYMENTS_SHEET)
+    const membersSheet = getSheet(CONFIG.MEMBERS_SHEET)
+    
+    const payLastRow = paymentsSheet.getLastRow()
+    if (payLastRow < 2) {
+      Logger.log('No payments to process')
+      return
+    }
+    
+    const payments = paymentsSheet.getRange(2, 1, payLastRow - 1, 3).getValues()
+    const memLastRow = membersSheet.getLastRow()
+    
+    if (memLastRow < 2) {
+      Logger.log('No members found')
+      return
+    }
+    
+    const members = membersSheet.getRange(2, 1, memLastRow - 1, 6).getValues()
+    
+    let processed = 0
+    const errors = []
+    const processedRows = []
+    
+    for (let pi = 0; pi < payments.length; pi++) {
+      const payment = payments[pi]
+      const payEmail = String(payment[CONFIG.COLS.PAYMENT.EMAIL]).trim()
+      
+      if (!payEmail) continue
+      
+      // Find member by email (case-insensitive)
+      let memberRowIdx = -1
+      for (let mi = 0; mi < members.length; mi++) {
+        if (String(members[mi][0]).toLowerCase() === payEmail.toLowerCase()) {
+          memberRowIdx = mi
+          break
+        }
+      }
+      
+      if (memberRowIdx === -1) {
+        errors.push(`ไม่พบ email: ${payEmail}`)
+        continue
+      }
+      
+      const member = members[memberRowIdx]
+      const currentStatus = member[CONFIG.COLS.MEMBER.STATUS]
+      const currentExpire = member[CONFIG.COLS.MEMBER.EXPIRE]
+      
+      // Calculate new expire date
+      let baseDate
+      if (!currentExpire || currentStatus === 'Expired') {
+        baseDate = formatDateStr(new Date())
+      } else if (currentExpire instanceof Date) {
+        baseDate = formatDateStr(currentExpire)
+      } else {
+        baseDate = String(currentExpire)
+      }
+      
+      const newExpireDate = addOneMonth(baseDate)
+      
+      // Update member row
+      const memberSheetRow = memberRowIdx + 2
+      membersSheet.getRange(memberSheetRow, CONFIG.COLS.MEMBER.STATUS + 1).setValue('Paid')
+      membersSheet.getRange(memberSheetRow, CONFIG.COLS.MEMBER.EXPIRE + 1).setValue(newExpireDate)
+      
+      // Update local cache
+      members[memberRowIdx][CONFIG.COLS.MEMBER.STATUS] = 'Paid'
+      members[memberRowIdx][CONFIG.COLS.MEMBER.EXPIRE] = newExpireDate
+      
+      processedRows.push(pi + 2) // sheet row number
+      processed++
+      
+      Logger.log(`Processed: ${payEmail} → expire: ${newExpireDate}`)
+    }
+    
+    // Clear processed payment rows (in reverse to avoid index shifting)
+    for (let i = processedRows.length - 1; i >= 0; i--) {
+      paymentsSheet.deleteRow(processedRows[i])
+    }
+    
+    const msg = `ประมวลผลสำเร็จ ${processed} ราย, ข้อผิดพลาด: ${errors.join(', ') || 'ไม่มี'}`
+    Logger.log(msg)
+    addLog('processPayments', msg, 'Success')
+    
+  } catch (e) {
+    const errMsg = 'Error: ' + e.message
+    Logger.log(errMsg)
+    addLog('processPayments', errMsg, 'Error')
+  }
+}
+
+/**
+ * Trigger เมื่อมีการ submit form (เช่น Google Form สำหรับรับการชำระ)
+ */
+function onFormSubmit(e) {
+  Logger.log('Form submitted, processing payments...')
+  Utilities.sleep(2000) // รอให้ข้อมูลบันทึกก่อน
+  processPayments()
+}
+
+/**
+ * สร้าง Trigger อัตโนมัติ (รันครั้งเดียวเพื่อตั้งค่า)
+ * ไปที่ Apps Script > Run > setupTriggers
+ */
+function setupTriggers() {
+  // ลบ trigger เก่า
+  const triggers = ScriptApp.getProjectTriggers()
+  triggers.forEach((t) => ScriptApp.deleteTrigger(t))
+  
+  // ตรวจสอบหมดอายุทุกวัน เวลา 00:00-01:00
+  ScriptApp.newTrigger('checkExpiredMembers')
+    .timeBased()
+    .everyDays(1)
+    .atHour(0)
+    .create()
+  
+  // ประมวลผลการชำระทุก 30 นาที
+  ScriptApp.newTrigger('processPayments')
+    .timeBased()
+    .everyMinutes(30)
+    .create()
+  
+  Logger.log('Triggers set up successfully!')
+  addLog('setupTriggers', 'Triggers created successfully', 'Success')
+  
+  SpreadsheetApp.getUi().alert(
+    '✅ ตั้งค่า Trigger สำเร็จ!\n\n' +
+    '• checkExpiredMembers: ทุกวัน 00:00\n' +
+    '• processPayments: ทุก 30 นาที'
+  )
+}
+
+/**
+ * สร้าง Sheet ที่จำเป็น พร้อม Header
+ */
+function initializeSheets() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet()
+  
+  // Members Sheet
+  let membersSheet = ss.getSheetByName(CONFIG.MEMBERS_SHEET)
+  if (!membersSheet) {
+    membersSheet = ss.insertSheet(CONFIG.MEMBERS_SHEET)
+  }
+  if (membersSheet.getLastRow() === 0) {
+    membersSheet.appendRow(['Email', 'FamilyGroup', 'ExpireDate', 'PaymentStatus', 'PaymentLink', 'Note'])
+    membersSheet.getRange(1, 1, 1, 6)
+      .setFontWeight('bold')
+      .setBackground('#ffc0c0')
+      .setFontColor('#c45f3f')
+  }
+  
+  // Payments Sheet
+  let paymentsSheet = ss.getSheetByName(CONFIG.PAYMENTS_SHEET)
+  if (!paymentsSheet) {
+    paymentsSheet = ss.insertSheet(CONFIG.PAYMENTS_SHEET)
+  }
+  if (paymentsSheet.getLastRow() === 0) {
+    paymentsSheet.appendRow(['Timestamp', 'Email', 'Amount'])
+    paymentsSheet.getRange(1, 1, 1, 3)
+      .setFontWeight('bold')
+      .setBackground('#d6d35f')
+  }
+  
+  // Logs Sheet
+  let logSheet = ss.getSheetByName(CONFIG.LOG_SHEET)
+  if (!logSheet) {
+    logSheet = ss.insertSheet(CONFIG.LOG_SHEET)
+    logSheet.appendRow(['Timestamp', 'Action', 'Detail', 'Status'])
+    logSheet.getRange(1, 1, 1, 4)
+      .setFontWeight('bold')
+      .setBackground('#c0c0ff')
+  }
+  
+  SpreadsheetApp.getUi().alert(
+    '✅ สร้าง Sheet สำเร็จ!\n\n' +
+    `• ${CONFIG.MEMBERS_SHEET}\n` +
+    `• ${CONFIG.PAYMENTS_SHEET}\n` +
+    `• ${CONFIG.LOG_SHEET}`
+  )
+}
+
+/**
+ * เพิ่ม Menu ใน Sheets UI
+ */
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('🎬 YouTube Family')
+    .addItem('📋 สร้าง Sheet', 'initializeSheets')
+    .addSeparator()
+    .addItem('💰 ประมวลผลการชำระ', 'processPayments')
+    .addItem('⏰ ตรวจสอบหมดอายุ', 'checkExpiredMembers')
+    .addSeparator()
+    .addItem('⚙️ ตั้งค่า Trigger อัตโนมัติ', 'setupTriggers')
+    .addToUi()
+}
